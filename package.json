@@ -1,0 +1,24 @@
+{
+  "name": "view-image-mcp",
+  "version": "1.0.0",
+  "description": "MCP server to display images inline in Kitty-protocol terminals (Ghostty, Kitty)",
+  "main": "index.js",
+  "type": "module",
+  "bin": {
+    "view-image-mcp": "./index.js"
+  },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": [
+    "mcp",
+    "image",
+    "kitty",
+    "ghostty"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.26.0",
+    "zod": "^4.3.6"
+  }
+}
