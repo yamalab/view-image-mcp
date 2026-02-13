@@ -2,12 +2,37 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import fs from "node:fs";
 import path from "node:path";
+import os from "node:os";
 import { execFileSync } from "node:child_process";
 
+const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50MB
 const CHUNK_SIZE = 4096;
+const SIPS_TIMEOUT = 30_000; // 30s
+
+/**
+ * パスを検証し、実在する絶対パスを返す。
+ * パストラバーサル・シンボリックリンク攻撃・ヌルバイト攻撃を防止。
+ */
+function validatePath(filePath) {
+  if (filePath.includes("\0")) {
+    throw new McpError(ErrorCode.InvalidParams, "Invalid path");
+  }
+
+  const resolved = path.resolve(filePath);
+
+  let realPath;
+  try {
+    realPath = fs.realpathSync(resolved);
+  } catch {
+    throw new McpError(ErrorCode.InvalidParams, "File not found");
+  }
+
+  return realPath;
+}
 
 function detectFormat(buffer) {
   if (
@@ -35,15 +60,29 @@ function detectFormat(buffer) {
 }
 
 function convertToPng(inputPath) {
-  const tmpPath = `/tmp/view-image-mcp-${Date.now()}.png`;
-  execFileSync("sips", ["-s", "format", "png", inputPath, "--out", tmpPath], {
-    stdio: "ignore",
-  });
-  return tmpPath;
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "view-image-mcp-"));
+  const tmpPath = path.join(tmpDir, "converted.png");
+  try {
+    execFileSync("sips", ["-s", "format", "png", inputPath, "--out", tmpPath], {
+      stdio: "ignore",
+      timeout: SIPS_TIMEOUT,
+    });
+  } catch (err) {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    throw err;
+  }
+  return { tmpPath, tmpDir };
 }
 
 function writeTtyKitty(pngBase64) {
-  const fd = fs.openSync("/dev/tty", "w");
+  let fd;
+  try {
+    fd = fs.openSync("/dev/tty", "w");
+  } catch {
+    throw new Error(
+      "Cannot open /dev/tty: terminal is not available in this environment",
+    );
+  }
   try {
     for (let i = 0; i < pngBase64.length; i += CHUNK_SIZE) {
       const chunk = pngBase64.slice(i, i + CHUNK_SIZE);
@@ -64,10 +103,14 @@ function writeTtyKitty(pngBase64) {
 }
 
 function displayImageFile(filePath) {
-  const absPath = path.resolve(filePath);
+  const absPath = validatePath(filePath);
 
-  if (!fs.existsSync(absPath)) {
-    throw new Error(`File not found: ${absPath}`);
+  const stat = fs.statSync(absPath);
+  if (stat.size > MAX_FILE_SIZE) {
+    throw new McpError(
+      ErrorCode.InvalidParams,
+      `File too large (${Math.round(stat.size / 1024 / 1024)}MB). Maximum allowed size is 50MB`,
+    );
   }
 
   const buffer = fs.readFileSync(absPath);
@@ -76,12 +119,12 @@ function displayImageFile(filePath) {
   if (format === "png") {
     writeTtyKitty(buffer.toString("base64"));
   } else if (["jpeg", "gif", "webp"].includes(format)) {
-    const tmpPng = convertToPng(absPath);
+    const { tmpPath, tmpDir } = convertToPng(absPath);
     try {
-      const pngBuffer = fs.readFileSync(tmpPng);
+      const pngBuffer = fs.readFileSync(tmpPath);
       writeTtyKitty(pngBuffer.toString("base64"));
     } finally {
-      fs.unlinkSync(tmpPng);
+      fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   } else {
     // Try sending as-is — terminal may handle it
@@ -94,37 +137,68 @@ const server = new McpServer({
   version: "1.0.0",
 });
 
-server.tool(
-  "view_image",
-  "Display an image file inline in the terminal using Kitty graphics protocol (Ghostty/Kitty). The image appears directly in the user's terminal.",
-  {
-    path: z.string().describe("Absolute or relative path to the image file"),
+server.registerTool("view_image", {
+  title: "View Image",
+  description:
+    "Display an image file inline in the terminal using Kitty graphics protocol (Ghostty/Kitty). The image appears directly in the user's terminal.",
+  inputSchema: {
+    path: z
+      .string()
+      .max(4096)
+      .describe("Absolute or relative path to the image file"),
   },
-  async ({ path: imagePath }) => {
-    try {
-      const absPath = path.resolve(imagePath);
-      displayImageFile(absPath);
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Image displayed inline in terminal: ${absPath}`,
-          },
-        ],
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error displaying image: ${error.message}`,
-          },
-        ],
-        isError: true,
-      };
+  annotations: {
+    readOnlyHint: true,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+  },
+}, async ({ path: imagePath }) => {
+  try {
+    server.sendLoggingMessage({
+      level: "info",
+      data: "Displaying image",
+    });
+
+    displayImageFile(imagePath);
+
+    const absPath = path.resolve(imagePath);
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Image displayed inline in terminal: ${absPath}`,
+        },
+      ],
+    };
+  } catch (error) {
+    if (error instanceof McpError) {
+      throw error;
     }
-  },
-);
+
+    server.sendLoggingMessage({
+      level: "error",
+      data: `Failed to display image: ${error.message}`,
+    });
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Error displaying image: ${error.message}`,
+        },
+      ],
+      isError: true,
+    };
+  }
+});
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
+
+function shutdown() {
+  server.close();
+  process.exit(0);
+}
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);
