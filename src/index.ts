@@ -13,18 +13,20 @@ const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50MB
 const CHUNK_SIZE = 4096;
 const SIPS_TIMEOUT = 30_000; // 30s
 
+type ImageFormat = "png" | "jpeg" | "gif" | "webp" | "unknown";
+
 /**
  * パスを検証し、実在する絶対パスを返す。
  * パストラバーサル・シンボリックリンク攻撃・ヌルバイト攻撃を防止。
  */
-function validatePath(filePath) {
+function validatePath(filePath: string): string {
   if (filePath.includes("\0")) {
     throw new McpError(ErrorCode.InvalidParams, "Invalid path");
   }
 
   const resolved = path.resolve(filePath);
 
-  let realPath;
+  let realPath: string;
   try {
     realPath = fs.realpathSync(resolved);
   } catch {
@@ -34,7 +36,7 @@ function validatePath(filePath) {
   return realPath;
 }
 
-function detectFormat(buffer) {
+function detectFormat(buffer: Buffer): ImageFormat {
   if (
     buffer[0] === 0x89 &&
     buffer[1] === 0x50 &&
@@ -59,7 +61,7 @@ function detectFormat(buffer) {
   return "unknown";
 }
 
-function convertToPng(inputPath) {
+function convertToPng(inputPath: string): { tmpPath: string; tmpDir: string } {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "view-image-mcp-"));
   const tmpPath = path.join(tmpDir, "converted.png");
   try {
@@ -74,8 +76,8 @@ function convertToPng(inputPath) {
   return { tmpPath, tmpDir };
 }
 
-function writeTtyKitty(pngBase64) {
-  let fd;
+function writeTtyKitty(pngBase64: string): void {
+  let fd: number;
   try {
     fd = fs.openSync("/dev/tty", "w");
   } catch {
@@ -102,7 +104,7 @@ function writeTtyKitty(pngBase64) {
   }
 }
 
-function displayImageFile(filePath) {
+function displayImageFile(filePath: string): void {
   const absPath = validatePath(filePath);
 
   const stat = fs.statSync(absPath);
@@ -166,26 +168,28 @@ server.registerTool("view_image", {
     return {
       content: [
         {
-          type: "text",
+          type: "text" as const,
           text: `Image displayed inline in terminal: ${absPath}`,
         },
       ],
     };
-  } catch (error) {
+  } catch (error: unknown) {
     if (error instanceof McpError) {
       throw error;
     }
 
+    const message = error instanceof Error ? error.message : String(error);
+
     server.sendLoggingMessage({
       level: "error",
-      data: `Failed to display image: ${error.message}`,
+      data: `Failed to display image: ${message}`,
     });
 
     return {
       content: [
         {
-          type: "text",
-          text: `Error displaying image: ${error.message}`,
+          type: "text" as const,
+          text: `Error displaying image: ${message}`,
         },
       ],
       isError: true,
@@ -196,7 +200,7 @@ server.registerTool("view_image", {
 const transport = new StdioServerTransport();
 await server.connect(transport);
 
-function shutdown() {
+function shutdown(): void {
   server.close();
   process.exit(0);
 }
