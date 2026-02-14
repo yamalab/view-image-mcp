@@ -15,6 +15,14 @@ const SIPS_TIMEOUT = 30_000; // 30s
 
 type ImageFormat = "png" | "jpeg" | "gif" | "webp" | "unknown";
 
+function isTermux(): boolean {
+  return "TERMUX_VERSION" in process.env;
+}
+
+function isMacOS(): boolean {
+  return process.platform === "darwin";
+}
+
 /**
  * パスを検証し、実在する絶対パスを返す。
  * パストラバーサル・シンボリックリンク攻撃・ヌルバイト攻撃を防止。
@@ -61,7 +69,7 @@ function detectFormat(buffer: Buffer): ImageFormat {
   return "unknown";
 }
 
-function convertToPng(inputPath: string): { tmpPath: string; tmpDir: string } {
+function convertToPngMacOS(inputPath: string): { tmpPath: string; tmpDir: string } {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "view-image-mcp-"));
   const tmpPath = path.join(tmpDir, "converted.png");
   try {
@@ -69,6 +77,19 @@ function convertToPng(inputPath: string): { tmpPath: string; tmpDir: string } {
       stdio: "ignore",
       timeout: SIPS_TIMEOUT,
     });
+  } catch (err) {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    throw err;
+  }
+  return { tmpPath, tmpDir };
+}
+
+async function convertToPngSharp(inputPath: string): Promise<{ tmpPath: string; tmpDir: string }> {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "view-image-mcp-"));
+  const tmpPath = path.join(tmpDir, "converted.png");
+  try {
+    const { default: sharp } = await import("sharp");
+    await sharp(inputPath).png().toFile(tmpPath);
   } catch (err) {
     fs.rmSync(tmpDir, { recursive: true, force: true });
     throw err;
@@ -104,24 +125,47 @@ function writeTtyKitty(pngBase64: string): void {
   }
 }
 
-function displayImageFile(filePath: string): void {
-  const absPath = validatePath(filePath);
+const MIME_TYPES: Record<ImageFormat, string> = {
+  png: "image/png",
+  jpeg: "image/jpeg",
+  gif: "image/gif",
+  webp: "image/webp",
+  unknown: "image/*",
+};
 
-  const stat = fs.statSync(absPath);
-  if (stat.size > MAX_FILE_SIZE) {
-    throw new McpError(
-      ErrorCode.InvalidParams,
-      `File too large (${Math.round(stat.size / 1024 / 1024)}MB). Maximum allowed size is 50MB`,
-    );
-  }
+/**
+ * Termux: am start で Android の画像ビューアを起動。
+ * 変換不要（Android ビューアが全フォーマット対応）。
+ */
+function displayImageTermux(absPath: string, buffer: Buffer): void {
+  const format = detectFormat(buffer);
+  const mimeType = MIME_TYPES[format];
+  execFileSync("am", [
+    "start", "-a", "android.intent.action.VIEW",
+    "-d", `file://${absPath}`,
+    "-t", mimeType,
+  ], {
+    stdio: "ignore",
+    timeout: SIPS_TIMEOUT,
+  });
+}
 
-  const buffer = fs.readFileSync(absPath);
+/**
+ * macOS/Linux: Kitty graphics protocol で端末にインライン表示。
+ */
+async function displayImageKitty(absPath: string, buffer: Buffer): Promise<void> {
   const format = detectFormat(buffer);
 
   if (format === "png") {
     writeTtyKitty(buffer.toString("base64"));
   } else if (["jpeg", "gif", "webp"].includes(format)) {
-    const { tmpPath, tmpDir } = convertToPng(absPath);
+    let tmpDir: string;
+    let tmpPath: string;
+    if (isMacOS()) {
+      ({ tmpPath, tmpDir } = convertToPngMacOS(absPath));
+    } else {
+      ({ tmpPath, tmpDir } = await convertToPngSharp(absPath));
+    }
     try {
       const pngBuffer = fs.readFileSync(tmpPath);
       writeTtyKitty(pngBuffer.toString("base64"));
@@ -134,6 +178,28 @@ function displayImageFile(filePath: string): void {
   }
 }
 
+async function displayImageFile(filePath: string): Promise<string> {
+  const absPath = validatePath(filePath);
+
+  const stat = fs.statSync(absPath);
+  if (stat.size > MAX_FILE_SIZE) {
+    throw new McpError(
+      ErrorCode.InvalidParams,
+      `File too large (${Math.round(stat.size / 1024 / 1024)}MB). Maximum allowed size is 50MB`,
+    );
+  }
+
+  const buffer = fs.readFileSync(absPath);
+
+  if (isTermux()) {
+    displayImageTermux(absPath, buffer);
+    return `Image opened in Android viewer: ${absPath}`;
+  }
+
+  await displayImageKitty(absPath, buffer);
+  return `Image displayed inline in terminal: ${absPath}`;
+}
+
 const server = new McpServer({
   name: "view-image",
   version: "1.0.0",
@@ -142,7 +208,7 @@ const server = new McpServer({
 server.registerTool("view_image", {
   title: "View Image",
   description:
-    "Display an image file inline in the terminal using Kitty graphics protocol (Ghostty/Kitty). The image appears directly in the user's terminal.",
+    "Display an image file. On Termux (Android), opens in the system image viewer. On macOS/Linux, displays inline using Kitty graphics protocol.",
   inputSchema: {
     path: z
       .string()
@@ -162,14 +228,13 @@ server.registerTool("view_image", {
       data: "Displaying image",
     });
 
-    displayImageFile(imagePath);
+    const message = await displayImageFile(imagePath);
 
-    const absPath = path.resolve(imagePath);
     return {
       content: [
         {
           type: "text" as const,
-          text: `Image displayed inline in terminal: ${absPath}`,
+          text: message,
         },
       ],
     };
